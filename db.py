@@ -4,8 +4,8 @@ Nothing is copied locally: each lookup queries production (read-only session) fo
 one user and the few content items recommended to them.
 
 Inside the production network (the intended deployment) the app connects straight to DB_HOST.
-Set SSH_HOST (with SSH_USER and SSH_KEY_PATH) only to reach the database from outside, through
-an SSH tunnel.
+Set SSH_HOST (with SSH_USER and SSH_KEY_PATH, and SSH_PORT if not 22) only to reach the database
+from outside, through an SSH tunnel.
 """
 
 import os
@@ -35,7 +35,7 @@ def _start_tunnel(host: str, port: int):
     from sshtunnel import SSHTunnelForwarder
 
     server = SSHTunnelForwarder(
-        (os.environ["SSH_HOST"], 22),
+        (os.environ["SSH_HOST"], int(os.getenv("SSH_PORT", "22"))),
         ssh_username=os.environ["SSH_USER"],
         ssh_pkey=os.path.expanduser(os.environ["SSH_KEY_PATH"]),
         remote_bind_address=(host, port),
