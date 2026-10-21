@@ -4,7 +4,6 @@ pandas
 python-dotenv
 sqlalchemy
 psycopg2-binary
-duckdb
 sshtunnel
 paramiko
 phonenumbers
