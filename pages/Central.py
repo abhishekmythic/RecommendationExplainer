@@ -1,18 +1,17 @@
 import redis
 import streamlit as st
 from dotenv import load_dotenv
+from sqlalchemy.exc import SQLAlchemyError
 
 load_dotenv()
 
 from centralized import build_table  # noqa: E402
-from db import load_tables  # noqa: E402  (needs .env loaded first)
 from recs import (  # noqa: E402
     KINDS,
     LANGUAGES,
     fetch_top,
     get_client,
     lookup_user,
-    refresh_sidebar,
     show_user_preferences,
     source_mix_badges,
     style_table,
@@ -33,18 +32,6 @@ except redis.RedisError as e:
     )
     st.stop()
 
-refresh_sidebar()
-
-try:
-    load_tables()
-except Exception as e:
-    st.error(f"Could not load the local dump: {e!r}")
-    st.info(
-        "Check that the local Postgres (main_character_dev) is running and that LOCAL_DB_URL is correct. "
-        "If a table is missing, click Refresh Data in the sidebar to pull it."
-    )
-    st.stop()
-
 selection = lookup_user("Show Central")
 if selection is None:
     st.stop()
@@ -58,6 +45,9 @@ for kind, kind_label in KINDS.items():
         frames[kind] = fetch_top(client, user_id, lang, kind, top_n)
     except redis.RedisError as e:
         st.error(f"Valkey error while reading {kind_label}: {e}")
+        st.stop()
+    except SQLAlchemyError as e:
+        st.error(f"Production database error while reading {kind_label}: {e!r}")
         st.stop()
 
 table = build_table(frames, seed=f"{user_id}:{lang}:{top_n}")

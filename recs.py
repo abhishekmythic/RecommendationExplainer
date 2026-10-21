@@ -11,14 +11,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from db import (  # noqa: E402  (needs .env loaded first)
-    TABLE_NAMES,
     build_phone_number,
     country_options,
     find_user_ids,
     get_titles,
     get_user_characters,
     get_user_language,
-    pull_latest_dump,
 )
 
 DEFAULT_TOP_N = 10
@@ -65,12 +63,15 @@ class ReadOnlyRedis(redis.Redis):
 
 @st.cache_resource(show_spinner="Connecting to Valkey...")
 def get_client() -> ReadOnlyRedis:
+    host = os.getenv("REDIS_HOST", "localhost")
     client = ReadOnlyRedis(
-        host=os.getenv("REDIS_HOST", "localhost"),
+        host=host,
         port=int(os.getenv("REDIS_PORT", "6379")),
         password=os.getenv("REDIS_PASSWORD") or None,
         ssl=os.getenv("REDIS_TLS", "true").lower() == "true",
-        ssl_cert_reqs=None,  # via an SSH tunnel the cert hostname won't match
+        # verify the certificate when connecting to the real endpoint; through a local SSH tunnel
+        # the certificate's hostname won't match, so it can't be verified there
+        ssl_cert_reqs=None if host in ("localhost", "127.0.0.1") else "required",
         decode_responses=True,
         socket_connect_timeout=5,
         socket_timeout=10,
@@ -188,6 +189,10 @@ def lookup_user(submit_label: str) -> tuple[str, str, int] | None:
     except ValueError as e:
         st.warning(str(e))
         st.stop()
+    except Exception as e:
+        st.error(f"Could not look the user up in production: {e!r}")
+        st.info("User data is read live from production over SSH. Check your network and the SSH_* and DB_* values in .env.")
+        st.stop()
 
     if not user_ids:
         st.warning(f"No user was found for that {search_by.lower()}.")
@@ -196,39 +201,6 @@ def lookup_user(submit_label: str) -> tuple[str, str, int] | None:
         st.error("More than one user matches: " + ", ".join(user_ids))
         st.stop()
     return user_ids[0], lang, top_n
-
-
-def refresh_sidebar() -> None:
-    """Sidebar section to pull chosen tables from production into the local dump."""
-    with st.sidebar:
-        st.header("Data")
-        st.caption(
-            "Pulls the chosen tables from production into your local dump. "
-            "Production is only read, never changed."
-        )
-        def set_all() -> None:
-            for t in TABLE_NAMES:
-                st.session_state[f"refresh_table_{t}"] = st.session_state["refresh_all_tables"]
-
-        # keep "Select all" in step with the individual boxes
-        st.session_state["refresh_all_tables"] = all(
-            st.session_state.get(f"refresh_table_{t}", False) for t in TABLE_NAMES
-        )
-        with st.popover("Select Tables", icon=":material/arrow_drop_down:", width="stretch"):
-            st.checkbox("Select all", key="refresh_all_tables", on_change=set_all)
-            st.divider()
-            chosen = [t for t in TABLE_NAMES if st.checkbox(t, key=f"refresh_table_{t}")]
-        st.caption(f"{len(chosen)} of {len(TABLE_NAMES)} tables selected." if chosen else "No tables selected.")
-        if st.button("Refresh Data", icon=":material/sync:", width="stretch", disabled=not chosen):
-            with st.status(f"Pulling {len(chosen)} table(s) from production...", expanded=True) as status:
-                bar = st.progress(0.0, text="Starting...")
-                try:
-                    counts = pull_latest_dump(on_progress=lambda msg, frac: bar.progress(frac, text=msg), tables=chosen)
-                except Exception as e:
-                    status.update(label="Refresh failed. The local dump was not changed.", state="error")
-                    st.error(repr(e))
-                else:
-                    status.update(label=f"Pulled {len(counts)} table(s), {sum(counts.values()):,} rows.", state="complete")
 
 
 def show_user_preferences(user_id: str) -> list[str]:

@@ -4,8 +4,9 @@ pandas
 python-dotenv
 sqlalchemy
 psycopg2-binary
-duckdb
-sshtunnel
-paramiko
 phonenumbers
 pycountry
+
+# Only needed to reach the database from outside the production network (set SSH_HOST):
+# sshtunnel
+# paramiko
