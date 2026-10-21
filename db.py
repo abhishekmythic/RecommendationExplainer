@@ -1,57 +1,76 @@
 """Everything the app reads from production Postgres, per user and per request.
 
 Nothing is copied locally: each lookup queries production (read-only session) for just the
-one user and the few content items recommended to them, over a long-lived SSH tunnel.
+one user and the few content items recommended to them.
+
+Inside the production network (the intended deployment) the app connects straight to DB_HOST.
+Set SSH_HOST (with SSH_USER and SSH_KEY_PATH) only to reach the database from outside, through
+an SSH tunnel.
 """
 
 import os
 import threading
 from urllib.parse import quote_plus
 
-import paramiko
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 
-# sshtunnel still references paramiko.DSSKey, which newer paramiko releases removed
-if not hasattr(paramiko, "DSSKey"):
-    paramiko.DSSKey = None
-
-from sshtunnel import SSHTunnelForwarder  # noqa: E402
-
 
 def _require_env(*names: str) -> None:
     missing = [k for k in names if not os.getenv(k)]
     if missing:
-        raise RuntimeError(f"Missing in .env: {', '.join(missing)}")
+        raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
 
-def _open_prod():
-    """Start an SSH tunnel to prod Postgres; return (tunnel, read-only SQLAlchemy engine)."""
-    _require_env("SSH_HOST", "SSH_USER", "SSH_KEY_PATH", "DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME")
+def _start_tunnel(host: str, port: int):
+    """SSH tunnel to host:port; the database is then reachable on 127.0.0.1:<tunnel.local_bind_port>."""
+    _require_env("SSH_USER", "SSH_KEY_PATH")
+    import paramiko
+
+    # sshtunnel still references paramiko.DSSKey, which newer paramiko releases removed
+    if not hasattr(paramiko, "DSSKey"):
+        paramiko.DSSKey = None
+    from sshtunnel import SSHTunnelForwarder
+
     server = SSHTunnelForwarder(
         (os.environ["SSH_HOST"], 22),
         ssh_username=os.environ["SSH_USER"],
         ssh_pkey=os.path.expanduser(os.environ["SSH_KEY_PATH"]),
-        remote_bind_address=(os.environ["DB_HOST"], int(os.getenv("DB_PORT", "5432"))),
+        remote_bind_address=(host, port),
         local_bind_address=("127.0.0.1", 0),  # auto-pick a free port
         set_keepalive=30,
     )
     server.start()
+    return server
+
+
+def _open_prod():
+    """Connect to prod Postgres; return (tunnel or None, read-only SQLAlchemy engine)."""
+    _require_env("DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME")
+    host, port = os.environ["DB_HOST"], int(os.getenv("DB_PORT", "5432"))
+    server = None
+    if os.getenv("SSH_HOST"):
+        server = _start_tunnel(host, port)
+        host, port = "127.0.0.1", server.local_bind_port
+    connect_args = {
+        "connect_timeout": 10,
+        # Postgres itself rejects any write on this connection
+        "options": "-c default_transaction_read_only=on",
+    }
+    if os.getenv("DB_SSLMODE"):
+        connect_args["sslmode"] = os.environ["DB_SSLMODE"]  # e.g. "require" or "verify-full"
     engine = create_engine(
         f"postgresql+psycopg2://{os.environ['DB_USER']}:{quote_plus(os.environ['DB_PASSWORD'])}"
-        f"@127.0.0.1:{server.local_bind_port}/{os.environ['DB_NAME']}",
-        connect_args={
-            "connect_timeout": 10,
-            # Postgres itself rejects any write on this connection
-            "options": "-c default_transaction_read_only=on",
-        },
+        f"@{host}:{port}/{os.environ['DB_NAME']}",
+        connect_args=connect_args,
+        pool_recycle=1800,
     )
     return server, engine
 
 
-# One long-lived tunnel + engine for the per-user queries, shared by every Streamlit session.
+# One long-lived engine (and tunnel, if any) for the queries, shared by every Streamlit session.
 _user_db: dict = {"server": None, "engine": None}
 _user_db_lock = threading.Lock()
 
@@ -67,7 +86,9 @@ def _close_user_db() -> None:
 
 def _user_engine(reconnect: bool = False):
     with _user_db_lock:
-        if reconnect or _user_db["server"] is None or not _user_db["server"].is_active:
+        server = _user_db["server"]
+        tunnel_down = server is not None and not server.is_active
+        if reconnect or _user_db["engine"] is None or tunnel_down:
             _close_user_db()
             _user_db["server"], _user_db["engine"] = _open_prod()
         return _user_db["engine"]
@@ -76,7 +97,7 @@ def _user_engine(reconnect: bool = False):
 def run_user_query(sql: str, **params) -> pd.DataFrame:
     """Run a named-parameter SQL (:name) on prod (read-only) and return a DataFrame.
 
-    The tunnel is opened on first use and kept; one dropped connection is retried on a fresh tunnel.
+    The connection is opened on first use and kept; one dropped connection is retried on a fresh one.
     """
     for attempt in (0, 1):
         try:
