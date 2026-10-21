@@ -63,12 +63,15 @@ class ReadOnlyRedis(redis.Redis):
 
 @st.cache_resource(show_spinner="Connecting to Valkey...")
 def get_client() -> ReadOnlyRedis:
+    host = os.getenv("REDIS_HOST", "localhost")
     client = ReadOnlyRedis(
-        host=os.getenv("REDIS_HOST", "localhost"),
+        host=host,
         port=int(os.getenv("REDIS_PORT", "6379")),
         password=os.getenv("REDIS_PASSWORD") or None,
         ssl=os.getenv("REDIS_TLS", "true").lower() == "true",
-        ssl_cert_reqs=None,  # via an SSH tunnel the cert hostname won't match
+        # verify the certificate when connecting to the real endpoint; through a local SSH tunnel
+        # the certificate's hostname won't match, so it can't be verified there
+        ssl_cert_reqs=None if host in ("localhost", "127.0.0.1") else "required",
         decode_responses=True,
         socket_connect_timeout=5,
         socket_timeout=10,
