@@ -188,6 +188,10 @@ def lookup_user(submit_label: str) -> tuple[str, str, int] | None:
     except ValueError as e:
         st.warning(str(e))
         st.stop()
+    except Exception as e:
+        st.error(f"Could not look the user up in production: {e!r}")
+        st.info("User data is read live from production over SSH. Check your network and the SSH_* and DB_* values in .env.")
+        st.stop()
 
     if not user_ids:
         st.warning(f"No user was found for that {search_by.lower()}.")

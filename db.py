@@ -1,10 +1,13 @@
 """In-memory copy of the content tables, loaded at app start and on "Refresh Data".
 
-Tables are read (SELECT only, read-only session) from the local dump database and copied
+Content tables are read (SELECT only, read-only session) from the local dump database and copied
 into an in-memory DuckDB, so they can be queried with SQL and handled as pandas DataFrames.
+Per-user data (preferences, language, email / phone lookup) is read live from production, for
+the one user asked about, over a long-lived read-only SSH tunnel.
 """
 
 import os
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -14,8 +17,9 @@ import duckdb
 import paramiko
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import OperationalError
 
 # sshtunnel still references paramiko.DSSKey, which newer paramiko releases removed
 if not hasattr(paramiko, "DSSKey"):
@@ -23,8 +27,8 @@ if not hasattr(paramiko, "DSSKey"):
 
 from sshtunnel import SSHTunnelForwarder  # noqa: E402
 
-# Only the tables the app queries. Add a table here when a new query needs it.
-TABLE_NAMES = [
+# Content tables: small, joined together for every title lookup, so copied into memory at start.
+MEMORY_TABLES = [
     "character",
     "season_variant",  # season titles
     "season_character",  # MAIN characters of a season
@@ -34,18 +38,37 @@ TABLE_NAMES = [
     "audio_research_character",
     "chapter",
     "mantra",
+]
+# User tables: large, and only ever read for one user at a time, so they are never copied.
+# Each lookup queries production directly (read-only) for just that user.
+USER_TABLES = [
     "user_character_preference",
     "ott_user_info",  # looks users up by email / phone
     "user_metadata",  # preferred language per user
 ]
+TABLE_NAMES = MEMORY_TABLES  # everything that is pulled from prod into the local dump
 
-# Tables where only some columns are wanted. ott_user_info also holds password_hash and
-# other personal data, which this app must never read or copy.
-TABLE_COLUMNS = {"ott_user_info": ["user_id", "email", "phone_number"], "user_metadata": ["id", "language"]}
-
+# Only the columns the app reads are pulled (the rest are long descriptions, URLs and statuses).
+# updated_at is kept on the content tables for the "newest record" caption. ott_user_info also
+# holds password_hash and other personal data, and user_metadata holds username, gender and age
+# range, which this app must never read or copy.
+TABLE_COLUMNS = {
+    "character": ["id", "name", "is_deleted", "updated_at"],
+    "season_variant": ["season_id", "title", "updated_at"],
+    "season_character": ["season_id", "character_id", "character_type", "is_deleted", "updated_at"],
+    "episode": ["id", "season_id", "updated_at"],
+    "episode_variant": ["episode_id", "title", "updated_at"],
+    "audio_research": ["id", "title", "character_id", "updated_at"],
+    "audio_research_character": ["audio_research_id", "character_id"],
+    "chapter": ["id", "title", "audio_research_id", "updated_at"],
+    "mantra": ["id", "title", "character_id", "is_deleted", "updated_at"],
+    "user_character_preference": ["user_id", "character_id", "is_deleted"],
+    "ott_user_info": ["user_id", "email", "phone_number"],
+    "user_metadata": ["id", "language"],
+}
 
 def _select_sql(table: str) -> str:
-    columns = ", ".join(f'"{c}"' for c in TABLE_COLUMNS[table]) if table in TABLE_COLUMNS else "*"
+    columns = ", ".join(f'"{c}"' for c in TABLE_COLUMNS[table])
     return f'SELECT {columns} FROM "{table}"'
 
 LOCAL_DB_URL = os.getenv(
@@ -63,7 +86,7 @@ class Tables:
 
 @st.cache_resource(show_spinner="Loading latest dump...")
 def load_tables() -> Tables:
-    """Copy every table in TABLE_NAMES from the local dump into an in-memory DuckDB."""
+    """Copy every table in MEMORY_TABLES from the local dump into an in-memory DuckDB."""
     engine = create_engine(
         LOCAL_DB_URL,
         connect_args={
@@ -75,7 +98,7 @@ def load_tables() -> Tables:
     con = duckdb.connect(":memory:")
     newest = None
     try:
-        for table in TABLE_NAMES:
+        for table in MEMORY_TABLES:
             df = pd.read_sql(_select_sql(table), engine)
             if "updated_at" in df.columns and df["updated_at"].notna().any():
                 latest = df["updated_at"].max()
@@ -95,9 +118,8 @@ def _require_env(*names: str) -> None:
         raise RuntimeError(f"Missing in .env: {', '.join(missing)}")
 
 
-@contextmanager
-def _prod_engine():
-    """Read-only SQLAlchemy engine on prod Postgres, through a short-lived SSH tunnel."""
+def _open_prod():
+    """Start an SSH tunnel to prod Postgres; return (tunnel, read-only SQLAlchemy engine)."""
     _require_env("SSH_HOST", "SSH_USER", "SSH_KEY_PATH", "DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME")
     server = SSHTunnelForwarder(
         (os.environ["SSH_HOST"], 22),
@@ -107,24 +129,64 @@ def _prod_engine():
         local_bind_address=("127.0.0.1", 0),  # auto-pick a free port
         set_keepalive=30,
     )
-    engine = None
+    server.start()
+    engine = create_engine(
+        f"postgresql+psycopg2://{os.environ['DB_USER']}:{quote_plus(os.environ['DB_PASSWORD'])}"
+        f"@127.0.0.1:{server.local_bind_port}/{os.environ['DB_NAME']}",
+        connect_args={
+            "connect_timeout": 10,
+            # Postgres itself rejects any write on this connection
+            "options": "-c default_transaction_read_only=on",
+        },
+    )
+    return server, engine
+
+
+@contextmanager
+def _prod_engine():
+    """Read-only SQLAlchemy engine on prod Postgres, through a short-lived SSH tunnel."""
+    server, engine = _open_prod()
     try:
-        server.start()
-        engine = create_engine(
-            f"postgresql+psycopg2://{os.environ['DB_USER']}:{quote_plus(os.environ['DB_PASSWORD'])}"
-            f"@127.0.0.1:{server.local_bind_port}/{os.environ['DB_NAME']}",
-            connect_args={
-                "connect_timeout": 10,
-                # Postgres itself rejects any write on this connection
-                "options": "-c default_transaction_read_only=on",
-            },
-            pool_pre_ping=True,
-        )
         yield engine
     finally:
-        if engine is not None:
-            engine.dispose()
+        engine.dispose()
         server.stop()
+
+
+# One long-lived tunnel + engine for the per-user queries, shared by every Streamlit session.
+_user_db: dict = {"server": None, "engine": None}
+_user_db_lock = threading.Lock()
+
+
+def _close_user_db() -> None:
+    engine, server = _user_db["engine"], _user_db["server"]
+    _user_db["engine"] = _user_db["server"] = None
+    if engine is not None:
+        engine.dispose()
+    if server is not None:
+        server.stop()
+
+
+def _user_engine(reconnect: bool = False):
+    with _user_db_lock:
+        if reconnect or _user_db["server"] is None or not _user_db["server"].is_active:
+            _close_user_db()
+            _user_db["server"], _user_db["engine"] = _open_prod()
+        return _user_db["engine"]
+
+
+def run_user_query(sql: str, **params) -> pd.DataFrame:
+    """Run a named-parameter SQL (:name) on prod (read-only) and return a DataFrame.
+
+    The tunnel is opened on first use and kept; one dropped connection is retried on a fresh tunnel.
+    """
+    for attempt in (0, 1):
+        try:
+            with _user_engine(reconnect=attempt == 1).connect() as conn:
+                return pd.read_sql(text(sql), conn, params=params)
+        except OperationalError:
+            if attempt == 1:
+                raise
 
 
 def _copy_tables(source_engine, dest_engine, on_progress=None, tables=None) -> dict[str, int]:
@@ -269,24 +331,31 @@ def get_titles(kind: str, ids: list[str]) -> pd.DataFrame:
 
 def get_user_characters(user_id: str) -> list[str]:
     """Names of the characters the user selected in their preferences."""
+    prefs = run_user_query(
+        """
+        SELECT DISTINCT character_id
+        FROM user_character_preference
+        WHERE user_id = :user_id AND COALESCE(is_deleted, FALSE) = FALSE
+        """,
+        user_id=user_id,
+    )
+    ids = prefs["character_id"].dropna().tolist()
+    if not ids:
+        return []
     df = run_query(
         """
-        SELECT DISTINCT c.name
-        FROM user_character_preference p
-        JOIN "character" c ON c.id = p.character_id
-        WHERE p.user_id = ?
-          AND COALESCE(p.is_deleted, FALSE) = FALSE
-          AND COALESCE(c.is_deleted, FALSE) = FALSE
-        ORDER BY c.name
+        SELECT DISTINCT name FROM "character"
+        WHERE id::VARCHAR IN (SELECT UNNEST(?::VARCHAR[])) AND COALESCE(is_deleted, FALSE) = FALSE
+        ORDER BY name
         """,
-        [user_id],
+        [ids],
     )
     return df["name"].tolist()
 
 
 def get_user_language(user_id: str) -> str | None:
     """The user's preferred language from user_metadata, or None when not set."""
-    df = run_query("SELECT language FROM user_metadata WHERE id = ?", [user_id])
+    df = run_user_query("SELECT language FROM user_metadata WHERE id = :user_id", user_id=user_id)
     values = df["language"].dropna().astype(str).str.strip()
     values = values[values != ""]
     return values.iloc[0] if len(values) else None
@@ -324,13 +393,13 @@ def find_user_ids(email: str | None = None, phone_number: str | None = None) -> 
     if bool(email) == bool(phone_number):
         raise ValueError("Search by either email or phone number, not both.")
     if email:
-        df = run_query(
-            "SELECT DISTINCT user_id FROM ott_user_info WHERE lower(trim(email)) = lower(trim(?))",
-            [email],
+        df = run_user_query(
+            "SELECT DISTINCT user_id FROM ott_user_info WHERE lower(trim(email)) = lower(trim(:email))",
+            email=email,
         )
     else:
-        df = run_query(
-            "SELECT DISTINCT user_id FROM ott_user_info WHERE trim(phone_number) = trim(?)",
-            [phone_number],
+        df = run_user_query(
+            "SELECT DISTINCT user_id FROM ott_user_info WHERE trim(phone_number) = trim(:phone)",
+            phone=phone_number,
         )
-    return df["user_id"].dropna().tolist()
+    return df["user_id"].dropna().astype(str).tolist()

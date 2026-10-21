@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from db import (  # noqa: E402  (needs .env loaded first)
-    TABLE_NAMES,
+    MEMORY_TABLES,
     build_phone_number,
     country_options,
     find_user_ids,
@@ -64,7 +64,7 @@ with st.sidebar:
     st.divider()
     loaded = time.strftime("%H:%M:%S", time.localtime(tables.loaded_at))
     st.markdown(":green-badge[Valkey connected · read-only]")
-    st.caption(f"{len(TABLE_NAMES)} tables loaded at {loaded}.")
+    st.caption(f"{len(MEMORY_TABLES)} content tables loaded at {loaded}.")
     if tables.data_as_of is not None:
         st.caption(f"Newest record in the dump: {tables.data_as_of:%d %b %Y, %H:%M}.")
 
