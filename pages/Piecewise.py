@@ -1,24 +1,9 @@
-import json
-import os
-import time
-
-import pandas as pd
 import redis
 import streamlit as st
 from dotenv import load_dotenv
+from sqlalchemy.exc import SQLAlchemyError
 
 load_dotenv()
-
-from db import (  # noqa: E402  (needs .env loaded first)
-    MEMORY_TABLES,
-    build_phone_number,
-    country_options,
-    find_user_ids,
-    get_titles,
-    get_user_characters,
-    load_tables,
-    pull_latest_dump,
-)
 
 from recs import (  # noqa: E402
     KINDS,
@@ -28,7 +13,6 @@ from recs import (  # noqa: E402
     fetch_top,
     get_client,
     lookup_user,
-    refresh_sidebar,
     show_user_preferences,
     source_mix_badges,
     style_table,
@@ -48,25 +32,9 @@ except redis.RedisError as e:
     )
     st.stop()
 
-refresh_sidebar()
-
-try:
-    tables = load_tables()
-except Exception as e:
-    st.error(f"Could not load the local dump: {e!r}")
-    st.info(
-        "Check that the local Postgres (main_character_dev) is running and that LOCAL_DB_URL is correct. "
-        "If a table is missing, click Refresh Data in the sidebar to pull it."
-    )
-    st.stop()
-
 with st.sidebar:
-    st.divider()
-    loaded = time.strftime("%H:%M:%S", time.localtime(tables.loaded_at))
     st.markdown(":green-badge[Valkey connected · read-only]")
-    st.caption(f"{len(MEMORY_TABLES)} content tables loaded at {loaded}.")
-    if tables.data_as_of is not None:
-        st.caption(f"Newest record in the dump: {tables.data_as_of:%d %b %Y, %H:%M}.")
+    st.caption("User and content data are read live from production, read-only.")
 
     st.divider()
     st.subheader("Source Legend")
@@ -87,6 +55,10 @@ if selection is not None:
         except redis.RedisError as e:
             with st.expander(kind_label):
                 st.error(f"Valkey error: {e}")
+            continue
+        except SQLAlchemyError as e:
+            with st.expander(kind_label):
+                st.error(f"Production database error: {e!r}")
             continue
         with st.expander(f"{kind_label} · {len(df)} shown"):
             if df.empty:
